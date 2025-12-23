@@ -16,7 +16,7 @@ B/mysql_pool.h
 ```
 
 ## 依赖
-- MySQL C API（`mysqlclient`）
+- MySQL
 - C++17
 
 ## 使用示例

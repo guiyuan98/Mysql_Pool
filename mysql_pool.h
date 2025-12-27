@@ -206,6 +206,9 @@ class Mysql_Pool // MySQL 连接池类
 
         // 如果没有空闲连接，尝试创建新连接
         if (stats.total_connections < config.max_connections) {
+            // 先在锁保护下预留位置，防止并发创建超过上限
+            stats.total_connections++;
+            stats.used_connections++;             // 预留使用位置
             lock.unlock();                        // 释放锁，因为创建连接可能需要较长时间
             auto conn = create_connection(false); // 创建后直接使用，不加入空闲队列
             lock.lock();
@@ -244,6 +247,9 @@ class Mysql_Pool // MySQL 连接池类
 
         // 尝试创建新连接（可能因为连接数限制解除）
         if (stats.total_connections < config.max_connections) {
+            // 先在锁保护下预留位置，防止并发创建超过上限
+            stats.total_connections++;
+            stats.used_connections++; // 预留使用位置
             lock.unlock();
             conn = create_connection(false); // 创建后直接使用，不加入空闲队列
             lock.lock();

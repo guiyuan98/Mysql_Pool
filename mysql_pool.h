@@ -1,475 +1,328 @@
 #pragma once
-#include <string>
-#include <mysql/mysql.h>
-#include <stdexcept>
-#include <memory>
-#include <mutex>
-#include <queue>
-#include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <mysql/mysql.h>
+#include <queue>
+#include <stdexcept>
+#include <string>
 #include <thread>
-
-class Mysql_Connection // MySQL 连接类
+class Mysql_Connection // MySQL 连接封装类
 {
-public:
-    MYSQL* conn_;
-    std::chrono::steady_clock::time_point last_borrow_time_; // 最后一次借用时间
-    std::chrono::steady_clock::time_point last_return_time_; // 最后一次归还时间
-
-    Mysql_Connection(const std::string& host, int port, const std::string& user,
-        const std::string& db_name, const std::string& password)
-        : conn_(nullptr)
-    {
-        conn_ = mysql_init(nullptr); // 初始化
-        if (!conn_)
-        {
-            throw std::runtime_error("mysql_init() failed");
+  private:
+    MYSQL *conn;                                            // mysql 连接句柄
+    std::chrono::steady_clock::time_point last_used_time;   // 记录上次使用时间
+    std::chrono::steady_clock::time_point last_return_time; // 记录上次归还时间
+  public:
+    Mysql_Connection(const std::string &host, int port, const std::string &user,
+                     const std::string &password, const std::string &db_name) {
+        conn = mysql_init(nullptr); // 初始化 MySQL 连接
+        if (!conn) {
+            throw std::runtime_error("mysql_init failed");
+        }
+        mysql_options(conn, MYSQL_OPT_RECONNECT, "1"); // 启用自动重连选项
+        if (!mysql_real_connect(conn, host.c_str(), user.c_str(), password.c_str(),
+                                db_name.c_str(), port, nullptr,
+                                CLIENT_MULTI_STATEMENTS)) {
+            std::string err = mysql_error(conn);
+            mysql_close(conn);
+            throw std::runtime_error("mysql_real_connect failed: " + err);
         }
 
-        // 设置连接选项
-        mysql_options(conn_, MYSQL_SET_CHARSET_NAME, "utf8mb4"); // 设置字符集
-        int reconnect = 1;
-        mysql_options(conn_, MYSQL_OPT_RECONNECT, &reconnect); // 启用自动重连
-
-        if (!mysql_real_connect(conn_, host.c_str(), user.c_str(),
-            password.c_str(), db_name.c_str(),
-            port, nullptr, CLIENT_MULTI_STATEMENTS))
-        {
-            std::string err = mysql_error(conn_);
-            mysql_close(conn_);
-            throw std::runtime_error("mysql_real_connect() failed: " + err);
-        }
-
-        // 设置连接属性
-        mysql_autocommit(conn_, 1); // 默认开启自动提交
-        last_borrow_time_ = std::chrono::steady_clock::now();// 初始化借用时间
-        last_return_time_ = std::chrono::steady_clock::now(); // 初始化归还时间
+        last_used_time = std::chrono::steady_clock::now();
+        last_return_time = std::chrono::steady_clock::now();
     }
-
-    ~Mysql_Connection()
-    {
-        if (conn_)
-        {
-            mysql_close(conn_); // 关闭连接
+    ~Mysql_Connection() {
+        if (conn) {
+            mysql_close(conn);
+            conn = nullptr;
         }
     }
-
-    // 检查连接是否有效
-    bool is_valid() const
+    MYSQL *get_conn() // 获取 MySQL 连接句柄
     {
-        if (!conn_) return false;
-        return mysql_ping(conn_) == 0;
+        return conn;
     }
-
-    // 重置连接状态
-    void reset()
+    bool is_valid() // 检查连接是否有效
     {
-        if (conn_)
-        {
-            mysql_reset_connection(conn_);// 重置连接
+        if (!conn) {
+            return false;
         }
+        return mysql_ping(conn) == 0;
+    }
+    void reset() // 重置连接状态
+    {
+        if (conn) {
+            mysql_reset_connection(conn);
+        }
+    }
+    std::chrono::steady_clock::time_point
+    get_last_used_time() const // 获取上次使用时间
+    {
+        return last_used_time;
+    }
+    std::chrono::steady_clock::time_point
+    get_last_return_time() const // 获取上次归还时间
+    {
+        return last_return_time;
+    }
+    void update_last_used_time() // 更新上次使用时间
+    {
+        last_used_time = std::chrono::steady_clock::now();
+    }
+    void update_last_return_time() // 更新上次归还时间
+    {
+        last_return_time = std::chrono::steady_clock::now();
     }
 };
 
 class Mysql_Pool // MySQL 连接池类
 {
-public:
-    struct PoolStats
+  private:
+    struct PoolConfig // 连接池配置结构体
     {
-        size_t total_connections;   // 总连接数
-        size_t idle_connections;    // 空闲连接数
-        size_t active_connections;  // 活跃连接数
-        size_t waiting_threads;     // 等待线程数
-        size_t created_connections; // 已创建连接数
-        size_t destroyed_connections; // 已销毁连接数
-    };
-
-private:
-    // 配置参数
-    std::string host_;           // 数据库主机地址
-    std::string user_;           // 数据库用户名
-    std::string db_name_;        // 数据库名称
-    std::string password_;       // 数据库密码
-    int port_;                   // 数据库端口号
-    size_t min_pool_size_;       // 最小连接池大小
-    size_t max_pool_size_;       // 最大连接池大小
-    std::chrono::seconds connection_timeout_; // 连接获取超时时间
-    std::chrono::seconds max_idle_time_;      // 最大空闲时间
-
-    // 连接池状态
-    std::queue<std::shared_ptr<Mysql_Connection>> pool_; // 空闲连接池
-    std::condition_variable cv_;              // 条件变量
-    mutable std::mutex mutex_;                // 互斥锁
-
-    // 统计信息
-    std::atomic<size_t> total_connections_{ 0 }; // 当前总连接数
-    std::atomic<size_t> created_connections_{ 0 }; // 已创建连接数
-    std::atomic<size_t> destroyed_connections_{ 0 }; // 已销毁连接数
-    std::atomic<size_t> waiting_threads_{ 0 }; // 等待线程数
-
-    // 清理线程控制
-    std::atomic<bool> cleanup_thread_running_{ false }; // 清理线程运行标志
-    std::thread cleanup_thread_; // 清理线程
-
-    // 创建新连接
-    std::shared_ptr<Mysql_Connection> create_connection()
+        std::string host;                        // 数据库主机地址
+        int port;                                // 数据库端口号
+        std::string user;                        // 数据库用户名
+        std::string password;                    // 数据库密码
+        std::string db_name;                     // 数据库名称
+        size_t min_connections;                  // 最小连接数
+        size_t max_connections;                  // 最大连接数
+        std::chrono::seconds connection_timeout; // 连接获取超时时间
+        std::chrono::seconds idle_timeout;       // 连接空闲超时时间
+    } config;
+    struct PoolStats {
+        std::atomic<int> total_connections; // 当前连接总数
+        std::atomic<int> free_connections;  // 当前空闲连接数
+        std::atomic<int> used_connections;  // 当前使用中的连接数
+        std::atomic<int> waiting_threads;   // 当前等待获取连接的线程数
+        std::atomic<int> task_nums;         // 当前任务数
+    } stats;
+    std::queue<std::shared_ptr<Mysql_Connection>>
+        free_connections;                                                         // 空闲连接队列
+    std::mutex mutex_;                                                            // 互斥锁
+    std::condition_variable cv_;                                                  // 条件变量，用于通知等待的线程
+    std::atomic<bool> shutdown_;                                                  // 连接池是否关闭
+    std::thread cleaner_thread;                                                   // 清理线程
+    std::shared_ptr<Mysql_Connection> create_connection(bool add_to_free = false) // 创建新的 MySQL 连接
     {
-        try
-        {
-            auto conn = std::make_shared<Mysql_Connection>(
-                host_, port_, user_, db_name_, password_);
-            created_connections_++; // 统计创建数
-            total_connections_++; // 增加总连接数
-            return conn;
+        auto conn = std::make_shared<Mysql_Connection>(
+            config.host, config.port, config.user, config.password, config.db_name);
+        stats.total_connections++;
+        if (add_to_free) {
+            stats.free_connections++;
         }
-        catch (const std::exception& e)
-        {
-            throw std::runtime_error("Failed to create connection: " + std::string(e.what()));
-        }
-    }
-
-    // 清理无效连接
-    void cleanup_idle_connections()
-    {
-        std::lock_guard<std::mutex> lock(mutex_); // 锁定连接池
-        std::queue<std::shared_ptr<Mysql_Connection>> valid_connections; // 有效连接队列
-        size_t removed_count = 0; // 移除计数
-        while (!pool_.empty())
-        {
-            auto conn = pool_.front();
-            pool_.pop();
-            bool should_remove = false; // 是否应移除连接
-            // 检查连接是否有效
-            if (!conn->is_valid())
-            {
-                should_remove = true;
-            }
-            // 检查是否空闲超时
-            else if (max_idle_time_.count() > 0)
-            {
-                auto idle_time = std::chrono::steady_clock::now() - conn->last_return_time_;
-                if (idle_time > max_idle_time_)
-                {
-                    should_remove = true;
-                }
-            }
-
-            if (should_remove)
-            {
-                destroyed_connections_++; // 统计销毁数
-                total_connections_--; // 减少总连接数
-                removed_count++; // 增加移除计数
-            }
-            else
-            {
-                valid_connections.push(conn); // 保留有效连接
-            }
-        }
-
-        pool_.swap(valid_connections); // 交换队列
-
-        // 如果连接数小于最小连接数，补充连接
-        while (pool_.size() < min_pool_size_ && total_connections_ < max_pool_size_)
-        {
-            try
-            {
-                pool_.push(create_connection());
-            }
-            catch (...)
-            {
-                break;
-            }
-        }
-    }
-
-    // 清理线程函数
-    void cleanup_thread_func()
-    {
-        while (cleanup_thread_running_)
-        {
-            std::this_thread::sleep_for(std::chrono::seconds(30)); // 每30秒清理一次
-            if (cleanup_thread_running_)
-            {
-                cleanup_idle_connections();
-            }
-        }
-    }
-
-public:
-    Mysql_Pool(const std::string& host, int port, const std::string& user,
-        const std::string& db_name, const std::string& password,
-        size_t min_pool_size = 5, size_t max_pool_size = 20,
-        std::chrono::seconds connection_timeout = std::chrono::seconds(5),
-        std::chrono::seconds max_idle_time = std::chrono::seconds(300))
-        : host_(host), port_(port), user_(user), db_name_(db_name),
-        password_(password), min_pool_size_(min_pool_size),
-        max_pool_size_(max_pool_size), connection_timeout_(connection_timeout),
-        max_idle_time_(max_idle_time)
-    {
-        if (min_pool_size_ > max_pool_size_)
-        {
-            throw std::invalid_argument("min_pool_size cannot be greater than max_pool_size");
-        }
-        if (min_pool_size_ == 0)
-        {
-            throw std::invalid_argument("min_pool_size must be greater than 0");
-        }
-        // 创建初始连接
-        for (size_t i = 0; i < min_pool_size_; ++i)
-        {
-            try
-            {
-                pool_.push(create_connection());
-            }
-            catch (const std::exception& e)
-            {
-                // 清理已创建的连接
-                while (!pool_.empty())
-                {
-                    auto conn = pool_.front();
-                    pool_.pop();
-                }
-                throw std::runtime_error("Failed to initialize connection pool: " + std::string(e.what()));
-            }
-        }
-        // 启动清理线程
-        cleanup_thread_running_ = true;
-        cleanup_thread_ = std::thread(&Mysql_Pool::cleanup_thread_func, this); // 启动清理线程
-    }
-    ~Mysql_Pool()
-    {
-        cleanup_thread_running_ = false; // 停止清理线程
-        if (cleanup_thread_.joinable()) // 等待线程结束
-        {
-            cleanup_thread_.join(); // 等待清理线程结束
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_); // 锁定连接池
-        while (!pool_.empty())
-        {
-            pool_.pop();
-        }
-    }
-    // 禁止拷贝
-    Mysql_Pool(const Mysql_Pool&) = delete;
-    Mysql_Pool& operator=(const Mysql_Pool&) = delete;
-    // 允许移动
-    Mysql_Pool(Mysql_Pool&&) = delete;
-    Mysql_Pool& operator=(Mysql_Pool&&) = delete;
-    // 获取连接
-    std::shared_ptr<Mysql_Connection> get_connection() // 获取连接
-    {
-        waiting_threads_++; // 增加等待线程数
-        std::unique_lock<std::mutex> lock(mutex_);
-        // 等待可用连接或超时
-        bool success = cv_.wait_for(lock, connection_timeout_, [this]()
-        {
-            return !pool_.empty() || total_connections_ < max_pool_size_; // 有可用连接或可创建新连接
-        });
-
-        if (!success) // 超时
-        {
-            waiting_threads_--;
-            throw std::runtime_error("Get connection timeout after " +
-                std::to_string(connection_timeout_.count()) + " seconds");
-        }
-        std::shared_ptr<Mysql_Connection> conn; // 连接指针
-        if (!pool_.empty()) // 使用池中连接
-        {
-            // 从池中获取连接
-            conn = pool_.front();
-            pool_.pop();
-            // 检查连接是否有效
-            if (!conn->is_valid())
-            {
-                destroyed_connections_++; // 统计销毁数
-                total_connections_--; // 减少总连接数
-                try
-                {
-                    conn = create_connection(); // 创建新连接
-                }
-                catch (const std::exception& e)
-                {
-                    waiting_threads_--;
-                    throw std::runtime_error("Connection is invalid and failed to create new one: " +
-                        std::string(e.what()));
-                }
-            }
-        }
-        else if (total_connections_ < max_pool_size_) // 创建新连接
-        {
-            // 创建新连接
-            try
-            {
-                conn = create_connection();
-            }
-            catch (const std::exception& e)
-            {
-                waiting_threads_--;
-                throw;
-            }
-        }
-        if (conn)
-        {
-            conn->last_borrow_time_ = std::chrono::steady_clock::now(); // 更新借用时间
-        }
-        waiting_threads_--;
         return conn;
     }
-    // 释放连接
-    void release_connection(std::shared_ptr<Mysql_Connection> conn)
+    void cleanup_idle_connections() // 清理无用的空闲连接
     {
-        if (!conn)
-        {
-            return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<std::shared_ptr<Mysql_Connection>>
+            valid_connections; // 临时队列存放有效连接
+        while (!free_connections.empty()) {
+            auto conn = free_connections.front();
+            free_connections.pop();
+            if (!conn->is_valid() ||
+                std::chrono::steady_clock::now() - conn->get_last_return_time() >
+                    config.idle_timeout) {
+                stats.total_connections--;
+                stats.free_connections--;
+            } else {
+                valid_connections.push(conn);
+            }
         }
-        // 重置连接状态
+        free_connections = std::move(valid_connections);
+        while (stats.total_connections < config.min_connections) {
+            auto conn = create_connection(true); // 创建空闲连接
+            free_connections.push(conn);
+        }
+    }
+    void cleanup_thread_func() // 清理线程函数
+    {
+        while (!shutdown_) {
+            std::this_thread::sleep_for(std::chrono::seconds(30)); // 每30秒清理一次
+            cleanup_idle_connections();
+        }
+    }
+
+  public:
+    Mysql_Pool(const std::string &host, int port, const std::string &user,
+               const std::string &password, const std::string &db_name,
+               size_t min_connections = 5, size_t max_connections = 20,
+               std::chrono::seconds connection_timeout = std::chrono::seconds(5),
+               std::chrono::seconds idle_timeout = std::chrono::seconds(300))
+        : shutdown_(false) {
+        config.host = host;
+        config.port = port;
+        config.user = user;
+        config.password = password;
+        config.db_name = db_name;
+        config.min_connections = min_connections;
+        config.max_connections = max_connections;
+        config.connection_timeout = connection_timeout;
+        config.idle_timeout = idle_timeout;
+        stats.total_connections = 0;
+        stats.free_connections = 0;
+        stats.used_connections = 0;
+        stats.waiting_threads = 0;
+        stats.task_nums = 0;
+        // 初始化连接池
+        for (int i = 0; i < config.min_connections; ++i) {
+            auto conn = create_connection(true); // 创建空闲连接
+            free_connections.push(conn);
+        }
+        cleaner_thread = std::thread(&Mysql_Pool::cleanup_thread_func, this);
+    }
+    ~Mysql_Pool() {
+        shutdown_ = true;
+        cv_.notify_all(); // 通知所有等待的线程，以便它们能正常退出
+        if (cleaner_thread.joinable())
+            cleaner_thread.join();
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!free_connections.empty())
+            free_connections.pop();
+    }
+    Mysql_Pool(const Mysql_Pool &) = delete; // 禁止拷贝
+    Mysql_Pool &operator=(const Mysql_Pool &) = delete;
+    std::shared_ptr<Mysql_Connection> get_connection() // 获取连接
+    {
+        if (shutdown_) {
+            throw std::runtime_error("Connection pool is shut down");
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        // 尝试直接获取空闲连接（快速路径）
+        if (!free_connections.empty()) {
+            auto conn = free_connections.front();
+            free_connections.pop();
+            stats.free_connections--;
+            stats.used_connections++;
+            conn->update_last_used_time();
+            return conn;
+        }
+
+        // 如果没有空闲连接，尝试创建新连接
+        if (stats.total_connections < config.max_connections) {
+            lock.unlock();                        // 释放锁，因为创建连接可能需要较长时间
+            auto conn = create_connection(false); // 创建后直接使用，不加入空闲队列
+            lock.lock();
+            stats.used_connections++; // 新创建的连接直接使用
+            conn->update_last_used_time();
+            return conn;
+        }
+
+        // 连接池已满，需要等待
+        stats.waiting_threads++;
+        auto expire_time = std::chrono::steady_clock::now() + config.connection_timeout;
+
+        // 使用条件变量等待，直到有空闲连接或超时
+        bool got_connection = cv_.wait_until(lock, expire_time, [this] {
+            return !free_connections.empty() || shutdown_ ||
+                   stats.total_connections < config.max_connections;
+        });
+
+        std::shared_ptr<Mysql_Connection> conn = nullptr;
+
+        if (shutdown_) {
+            stats.waiting_threads--;
+            throw std::runtime_error("Connection pool is shut down");
+        }
+
+        // 再次尝试获取连接
+        if (!free_connections.empty()) {
+            conn = free_connections.front();
+            free_connections.pop();
+            stats.free_connections--;
+            stats.used_connections++;
+            conn->update_last_used_time();
+            stats.waiting_threads--;
+            return conn;
+        }
+
+        // 尝试创建新连接（可能因为连接数限制解除）
+        if (stats.total_connections < config.max_connections) {
+            lock.unlock();
+            conn = create_connection(false); // 创建后直接使用，不加入空闲队列
+            lock.lock();
+            stats.used_connections++; // 新创建的连接直接使用
+            conn->update_last_used_time();
+            stats.waiting_threads--;
+            return conn;
+        }
+
+        // 超时且无法获取连接
+        stats.waiting_threads--;
+        throw std::runtime_error("Get connection timed out");
+    }
+    void return_connection(std::shared_ptr<Mysql_Connection> conn) // 归还连接
+    {
+        if (!conn) {
+            return; // 避免空指针
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        conn->update_last_return_time();
         conn->reset();
-        conn->last_return_time_ = std::chrono::steady_clock::now(); // 更新归还时间
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            // 如果连接池已满或连接无效，销毁连接
-            if (pool_.size() >= max_pool_size_ || !conn->is_valid())
-            {
-                destroyed_connections_++; // 统计销毁数
-                total_connections_--; // 减少总连接数
-            }
-            else
-            {
-                pool_.push(conn);
-            }
-        }
+        free_connections.push(conn);
+        stats.free_connections++;
+        stats.used_connections--;
+        // 通知等待的线程有空闲连接可用（关键优化：使用条件变量立即唤醒）
         cv_.notify_one();
     }
-
-    // 强制清理所有连接
-    void cleanup_all_connections()
+    void cleanup_all_connections() // 清理所有连接
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!pool_.empty())
-        {
-            auto conn = pool_.front();
-            pool_.pop();
-            destroyed_connections_++;
-            total_connections_--;
+        while (!free_connections.empty()) {
+            free_connections.pop();
+            stats.total_connections--;
+            stats.free_connections--;
         }
-        // 重新创建最小连接数
-        for (size_t i = 0; i < min_pool_size_; ++i)
-        {
-            try
-            {
-                pool_.push(create_connection());
-            }
-            catch (...)
-            {
-                break;
-            }
+        while (stats.total_connections < config.min_connections) {
+            auto conn = create_connection(true); // 创建空闲连接
+            free_connections.push(conn);
         }
     }
-
-    // 获取统计信息
-    PoolStats get_stats() const
+    std::string get_stats() const // 获取连接池状态
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        size_t total = total_connections_.load(); // 总连接数
-        size_t idle = pool_.size(); // 空闲连接数
-        size_t active = total > idle ? total - idle : 0; // 活跃连接数
-        return PoolStats{
-            total,
-            idle,
-            active,
-            waiting_threads_.load(),
-            created_connections_.load(),
-            destroyed_connections_.load()
-        };
-    }
-
-    // 手动清理空闲连接
-    void manual_cleanup()
-    {
-        cleanup_idle_connections(); // 清理空闲连接
+        return "Total Connections: " +
+               std::to_string(stats.total_connections.load()) +
+               ", Free Connections: " +
+               std::to_string(stats.free_connections.load()) +
+               ", Used Connections: " +
+               std::to_string(stats.used_connections.load()) +
+               ", Waiting Threads: " +
+               std::to_string(stats.waiting_threads.load()) +
+               ", Task Nums: " + std::to_string(stats.task_nums.load());
     }
 };
 
-// RAII 连接守卫
-class MySQLConnGuard
+class Mysql_Connection_RAII // MySQL 连接 RAII 封装类
 {
-public:
-    explicit MySQLConnGuard(Mysql_Pool& pool)
-        : pool_(pool), conn_(nullptr)
-    {
-        conn_ = pool_.get_connection();
-    }
+  private:
+    Mysql_Pool &pool_;
+    std::shared_ptr<Mysql_Connection> connection_;
 
-    ~MySQLConnGuard()
-    {
-        if (conn_)
-        {
-            pool_.release_connection(conn_);
+  public:
+    Mysql_Connection_RAII(Mysql_Pool &pool) : pool_(pool) {
+        connection_ = pool_.get_connection();
+    }
+    ~Mysql_Connection_RAII() {
+        if (connection_) {
+            pool_.return_connection(connection_);
         }
     }
-
-    // 禁止拷贝
-    MySQLConnGuard(const MySQLConnGuard&) = delete;
-    MySQLConnGuard& operator=(const MySQLConnGuard&) = delete;
-
-    // 允许移动
-    MySQLConnGuard(MySQLConnGuard&& other) noexcept
-        : pool_(other.pool_), conn_(std::move(other.conn_))
+    Mysql_Connection_RAII(const Mysql_Connection_RAII &) = delete; // 禁止拷贝
+    Mysql_Connection_RAII &operator=(const Mysql_Connection_RAII &) = delete;
+    Mysql_Connection_RAII(Mysql_Connection_RAII &&) = delete; // 禁止移动
+    Mysql_Connection_RAII &operator=(Mysql_Connection_RAII &&) = delete;
+    MYSQL *get_conn() // 获取 MySQL 连接句柄
     {
-        other.conn_.reset();
+        return connection_->get_conn();
     }
-
-    MySQLConnGuard& operator=(MySQLConnGuard&& other) noexcept
+    bool is_valid() // 检查连接是否有效
     {
-        if (this != &other)
-        {
-            if (conn_)
-            {
-                pool_.release_connection(conn_);
-            }
-            conn_ = std::move(other.conn_);
-            other.conn_.reset();
-        }
-        return *this;
+        return connection_->is_valid();
     }
-
-    // 访问连接
-    MYSQL* operator->() const // 访问 MYSQL 结构体
-    {
-        if (!conn_ || !conn_->conn_)
-        {
-            throw std::runtime_error("Invalid MySQL connection");
-        }
-        return conn_->conn_;
-    }
-
-    MYSQL* get() const // 获取 MYSQL 结构体 指针                                                                       
-    {
-        if (!conn_ || !conn_->conn_)
-        {
-            throw std::runtime_error("Invalid MySQL connection");
-        }
-        return conn_->conn_;
-    }
-    // 检查连接是否有效
-    bool is_valid() const
-    {
-        return conn_ && conn_->is_valid();
-    }
-    // 显式归还连接
-    void release()
-    {
-        if (conn_)
-        {
-            pool_.release_connection(conn_);
-            conn_.reset();
-        }
-    }
-
-private:
-    Mysql_Pool& pool_;
-    std::shared_ptr<Mysql_Connection> conn_;
 };
